@@ -12,7 +12,7 @@ def traj_segment_generator(pi, env, horizon, stochastic):
     t = 0
     ac = env.action_space.sample() # not used, just so we have the datatype
     new = True # marks if we're on first timestep of an episode
-    ob = env.reset()
+    ob, ob_entities, entity_mask = env.reset()
 
     cur_ep_ret = 0 # return in current episode
     cur_ep_len = 0 # len of current episode
@@ -21,6 +21,8 @@ def traj_segment_generator(pi, env, horizon, stochastic):
 
     # Initialize history arrays
     obs = np.array([ob for _ in range(horizon)])
+    obs_entities = np.array([ob_entities for _ in range(horizon)])
+    entity_masks = np.array([[False] * env.entity_max for _ in range(horizon)])
     rews = np.zeros(horizon, 'float32')
     vpreds = np.zeros(horizon, 'float32')
     news = np.zeros(horizon, 'int32')
@@ -29,26 +31,30 @@ def traj_segment_generator(pi, env, horizon, stochastic):
 
     while True:
         prevac = ac
-        ac, vpred = pi.act(stochastic, ob)
+        ac, vpred = pi.act(stochastic, (ob, ob_entities, entity_mask))
         # Slight weirdness here because we need value function at time T
         # before returning segment [0, T-1] so we get the correct
         # terminal value
         if t > 0 and t % horizon == 0:
-            yield {"ob" : obs, "rew" : rews, "vpred" : vpreds, "new" : news,
+            yield {"ob" : obs, "ob_entities": obs_entities, "entity_mask" : entity_masks,
+                    "rew" : rews, "vpred" : vpreds, "new" : news,
                     "ac" : acs, "prevac" : prevacs, "nextvpred": vpred * (1 - new),
                     "ep_rets" : ep_rets, "ep_lens" : ep_lens}
             # Be careful!!! if you change the downstream algorithm to aggregate
             # several of these batches, then be sure to do a deepcopy
+            obs_entities = np.array([ob_entities for _ in range(horizon)])
             ep_rets = []
             ep_lens = []
         i = t % horizon
         obs[i] = ob
+        entity_masks[i] = entity_mask
+        obs_entities[i] = ob_entities
         vpreds[i] = vpred
         news[i] = new
         acs[i] = ac
         prevacs[i] = prevac
 
-        ob, rew, new, _ = env.step(ac)
+        (ob, ob_entities, entity_mask), rew, new, _ = env.step(ac)
         rews[i] = rew
 
         cur_ep_ret += rew
@@ -58,7 +64,7 @@ def traj_segment_generator(pi, env, horizon, stochastic):
             ep_lens.append(cur_ep_len)
             cur_ep_ret = 0
             cur_ep_len = 0
-            ob = env.reset()
+            (ob, ob_entities, entity_mask) = env.reset()
         t += 1
 
 def add_vtarg_and_adv(seg, gamma, lam):
@@ -100,6 +106,8 @@ def learn(env, policy_fn, *,
     clip_param = clip_param * lrmult # Annealed cliping parameter epislon
 
     ob = U.get_placeholder_cached(name="ob")
+    ob_entities = U.get_placeholder_cached(name='ob_entities')
+    entity_mask = U.get_placeholder_cached(name='entity_mask')
     ac = pi.pdtype.sample_placeholder([None])
 
     kloldnew = oldpi.pd.kl(pi.pd)
@@ -113,17 +121,18 @@ def learn(env, policy_fn, *,
     surr2 = tf.clip_by_value(ratio, 1.0 - clip_param, 1.0 + clip_param) * atarg #
     pol_surr = - tf.reduce_mean(tf.minimum(surr1, surr2)) # PPO's pessimistic surrogate (L^CLIP)
     vf_loss = tf.reduce_mean(tf.square(pi.vpred - ret))
-    total_loss = pol_surr + pol_entpen + vf_loss
-    losses = [pol_surr, pol_entpen, vf_loss, meankl, meanent]
-    loss_names = ["pol_surr", "pol_entpen", "vf_loss", "kl", "ent"]
+    total_loss = pol_surr + pol_entpen + vf_loss + pi.attention_entropy
+    losses = [pol_surr, pol_entpen, vf_loss, meankl, meanent, pi.attention_entropy]
+    loss_names = ["pol_surr", "pol_entpen", "vf_loss", "kl", "ent", "att_ent"]
 
     var_list = pi.get_trainable_variables()
-    lossandgrad = U.function([ob, ac, atarg, ret, lrmult], losses + [U.flatgrad(total_loss, var_list)])
+    lossandgrad = U.function([ob, ob_entities, entity_mask, ac, atarg, ret, lrmult],
+        losses + [U.flatgrad(total_loss, var_list)])
     adam = MpiAdam(var_list, epsilon=adam_epsilon)
 
     assign_old_eq_new = U.function([],[], updates=[tf.assign(oldv, newv)
         for (oldv, newv) in zipsame(oldpi.get_variables(), pi.get_variables())])
-    compute_losses = U.function([ob, ac, atarg, ret, lrmult], losses)
+    compute_losses = U.function([ob, ob_entities, entity_mask, ac, atarg, ret, lrmult], losses)
 
     U.initialize()
     adam.sync()
@@ -165,33 +174,41 @@ def learn(env, policy_fn, *,
         add_vtarg_and_adv(seg, gamma, lam)
 
         # ob, ac, atarg, ret, td1ret = map(np.concatenate, (obs, acs, atargs, rets, td1rets))
-        ob, ac, atarg, tdlamret = seg["ob"], seg["ac"], seg["adv"], seg["tdlamret"]
+        ob, ob_entities, entity_mask, ac, atarg, tdlamret = (
+            seg["ob"], seg["ob_entities"], seg["entity_mask"], seg["ac"], seg["adv"], seg["tdlamret"])
         vpredbefore = seg["vpred"] # predicted value function before udpate
         atarg = (atarg - atarg.mean()) / atarg.std() # standardized advantage function estimate
-        d = Dataset(dict(ob=ob, ac=ac, atarg=atarg, vtarg=tdlamret), shuffle=not pi.recurrent)
+        d = Dataset(dict(ob=ob, ob_entities=ob_entities, entity_mask=entity_mask, ac=ac, atarg=atarg, vtarg=tdlamret),
+            shuffle=not pi.recurrent)
         optim_batchsize = optim_batchsize or ob.shape[0]
 
         if hasattr(pi, "ob_rms"): pi.ob_rms.update(ob) # update running mean/std for policy
 
         assign_old_eq_new() # set old parameter values to new parameter values
-        logger.log("Optimizing...")
-        logger.log(fmt_row(13, loss_names))
+        #logger.log("Optimizing...")
+        #logger.log(fmt_row(13, loss_names))
         # Here we do a bunch of optimization epochs over the data
         for _ in range(optim_epochs):
             losses = [] # list of tuples, each of which gives the loss for a minibatch
             for batch in d.iterate_once(optim_batchsize):
-                *newlosses, g = lossandgrad(batch["ob"], batch["ac"], batch["atarg"], batch["vtarg"], cur_lrmult)
+                ob_entities = batch["ob_entities"]
+                ob_entities = ob_entities.reshape((ob_entities.shape[0], env.entity_max, env.entity_dim))
+                *newlosses, g = lossandgrad(batch["ob"], ob_entities, batch["entity_mask"],
+                    batch["ac"], batch["atarg"], batch["vtarg"], cur_lrmult)
                 adam.update(g, optim_stepsize * cur_lrmult)
                 losses.append(newlosses)
-            logger.log(fmt_row(13, np.mean(losses, axis=0)))
+            #logger.log(fmt_row(13, np.mean(losses, axis=0)))
 
-        logger.log("Evaluating losses...")
+        #logger.log("Evaluating losses...")
         losses = []
         for batch in d.iterate_once(optim_batchsize):
-            newlosses = compute_losses(batch["ob"], batch["ac"], batch["atarg"], batch["vtarg"], cur_lrmult)
+            ob_entities = batch["ob_entities"]
+            ob_entities = ob_entities.reshape((ob_entities.shape[0], env.entity_max, env.entity_dim))
+            newlosses = compute_losses(batch["ob"], ob_entities, batch["entity_mask"],
+                batch["ac"], batch["atarg"], batch["vtarg"], cur_lrmult)
             losses.append(newlosses)
         meanlosses,_,_ = mpi_moments(losses, axis=0)
-        logger.log(fmt_row(13, meanlosses))
+        #logger.log(fmt_row(13, meanlosses))
         for (lossval, name) in zipsame(meanlosses, loss_names):
             logger.record_tabular("loss_"+name, lossval)
         logger.record_tabular("ev_tdlam_before", explained_variance(vpredbefore, tdlamret))
